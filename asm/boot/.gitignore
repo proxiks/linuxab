@@ -1,0 +1,9 @@
+# Bootloader build artifacts
+*.bin
+*.lst
+*.map
+*.o
+*.elf
+boot_sector.bin
+stage2.bin
+multiboot.bin
