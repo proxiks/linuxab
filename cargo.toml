@@ -1,0 +1,9 @@
+# Cargo.toml add karo
+[package]
+name = "linuxab"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Agar tumhe alloc chahiye toh:
+# (no_std mein alloc built-in hota hai, bas enable karna padta hai)
