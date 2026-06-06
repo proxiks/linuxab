@@ -1,1297 +1,1037 @@
-//! Complete Terminal Emulator with Bash-like Shell
-//! Supports Arch, Ubuntu, Debian, Gentoo, and standard Unix commands
+//! linuxab  Terminal Shell (terl.rs)
+//!  (c) jatin kaushik
 
-use core::fmt::Write;
+#![no_std]
+#![allow(dead_code)]
+#![allow(static_mut_refs)]
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-// C FFI for cursor
+
 extern "C" {
     fn cursor_init();
     fn cursor_set_pos(x: u8, y: u8);
-    fn cursor_get_pos(x: *mut u8, y: *mut u8);
     fn cursor_putchar(c: u8);
-    fn cursor_print(s: *const u8);
-    fn cursor_print_colored(s: *const u8, fg: u8, bg: u8);
     fn cursor_clear_screen();
     fn cursor_set_color(fg: u8, bg: u8);
-    fn cursor_hide();
-    fn cursor_show();
-    fn cursor_blink();
-    fn cursor_draw_box(x1: u8, y1: u8, x2: u8, y2: u8);
-    fn cursor_fill_region(x1: u8, y1: u8, x2: u8, y2: u8, fg: u8, bg: u8);
     fn cursor_move(dx: i8, dy: i8);
-    fn cursor_insert_char(c: u8);
-    fn cursor_delete_char();
-    fn cursor_insert_line();
-    fn cursor_delete_line();
 }
 
-const MAX_HISTORY: usize = 100;
+
+const MAX_HISTORY: usize = 64;
 const MAX_CMD_LEN: usize = 256;
-const MAX_ARGS: usize = 32;
-const MAX_PATH: usize = 256;
-const MAX_PROCESSES: usize = 64;
+const MAX_ARGS: usize = 16;
+const MAX_PATH: usize = 128;
+const MAX_NAME: usize = 32;
+const MAX_FILES: usize = 48;
+const MAX_FILE_SIZE: usize = 4096;
+const MAX_ENV: usize = 16;
+const MAX_ALIAS: usize = 16;
+const MAX_PROCS: usize = 16;
 
-/// ANSI Colors
-#[allow(dead_code)]
-#[repr(u8)]
-pub enum AnsiColor {
-    Black = 0,
-    Red = 1,
-    Green = 2,
-    Yellow = 3,
-    Blue = 4,
-    Magenta = 5,
-    Cyan = 6,
-    White = 7,
-    BrightBlack = 8,
-    BrightRed = 9,
-    BrightGreen = 10,
-    BrightYellow = 11,
-    BrightBlue = 12,
-    BrightMagenta = 13,
-    BrightCyan = 14,
-    BrightWhite = 15,
+const C_BLACK: u8 = 0;
+const C_RED: u8 = 1;
+const C_GREEN: u8 = 2;
+const C_YELLOW: u8 = 3;
+const C_BLUE: u8 = 4;
+const C_MAGENTA: u8 = 5;
+const C_CYAN: u8 = 6;
+const C_WHITE: u8 = 7;
+const C_BGREEN: u8 = 10;
+const C_BYELLOW: u8 = 14;
+const C_BCYAN: u8 = 11;
+const C_BRED: u8 = 9;
+
+
+#[repr(C)]
+pub struct ProcInfo {
+    pid: u32,
+    ppid: u32,
+    state: u8,
+    name: [u8; 16],
+    cmdline: [u8; 64],
 }
 
-/// Command history entry
-pub struct HistoryEntry {
-    pub cmd: [u8; MAX_CMD_LEN],
-    pub len: usize,
+struct HistoryEntry {
+    cmd: [u8; MAX_CMD_LEN],
+    len: usize,
 }
 
-/// Process info (for ps/top)
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub ppid: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub state: u8, // R=running, S=sleeping, Z=zombie, etc.
-    pub priority: i8,
-    pub nice: i8,
-    pub cpu_percent: u8,
-    pub mem_percent: u8,
-    pub name: [u8; 16],
-    pub cmdline: [u8; 128],
+struct EnvVar {
+    name: [u8; 32],
+    value: [u8; 64],
 }
 
-/// Environment variable
-pub struct EnvVar {
-    pub name: [u8; 64],
-    pub value: [u8; 256],
+struct Alias {
+    name: [u8; 32],
+    cmd: [u8; MAX_CMD_LEN],
+    len: usize,
 }
 
-/// Alias
-pub struct Alias {
-    pub name: [u8; 64],
-    pub cmd: [u8; MAX_CMD_LEN],
+struct FileEntry {
+    path: [u8; MAX_PATH],
+    data: [u8; MAX_FILE_SIZE],
+    size: usize,
+    is_dir: bool,
+    used: bool,
 }
 
-/// Terminal state
-pub struct Terminal {
-    pub buffer: [u8; MAX_CMD_LEN],
-    pub pos: usize,
-    pub history: [HistoryEntry; MAX_HISTORY],
-    pub history_count: usize,
-    pub history_index: usize,
-    pub prompt: [u8; 64],
-    pub prompt_len: usize,
-    pub cwd: [u8; MAX_PATH],
-    pub cwd_len: usize,
-    pub env: [EnvVar; 64],
-    pub env_count: usize,
-    pub aliases: [Alias; 32],
-    pub alias_count: usize,
-    pub last_exit_code: i32,
-    pub fg_color: u8,
-    pub bg_color: u8,
-    pub prompt_color: u8,
-    pub user_color: u8,
-    pub host_color: u8,
-    pub path_color: u8,
-    pub processes: [ProcessInfo; MAX_PROCESSES],
-    pub process_count: usize,
-    pub jobs: [u32; 16], // Background job PIDs
-    pub job_count: usize,
-    pub scrollback: [[u8; 80]; 1000], // Scrollback buffer
-    pub scrollback_lines: usize,
-    pub scrollback_pos: usize,
-    pub insert_mode: bool,
-    pub echo_enabled: bool,
+
+static mut HISTORY: [HistoryEntry; MAX_HISTORY] =
+    [HistoryEntry { cmd: [0; MAX_CMD_LEN], len: 0 }; MAX_HISTORY];
+static mut HISTORY_COUNT: usize = 0;
+
+static mut ENV: [EnvVar; MAX_ENV] = [EnvVar { name: [0; 32], value: [0; 64] }; MAX_ENV];
+static mut ENV_COUNT: usize = 0;
+
+static mut ALIASES: [Alias; MAX_ALIAS] =
+    [Alias { name: [0; 32], cmd: [0; MAX_CMD_LEN], len: 0 }; MAX_ALIAS];
+static mut ALIAS_COUNT: usize = 0;
+
+static mut CWD: [u8; MAX_PATH] = [b'/' ; MAX_PATH];
+static mut CWD_LEN: usize = 1;
+
+static mut FILES: [FileEntry; MAX_FILES] = [FileEntry {
+    path: [0; MAX_PATH],
+    data: [0; MAX_FILE_SIZE],
+    size: 0,
+    is_dir: false,
+    used: false,
+}; MAX_FILES];
+
+static mut PROCESS_TABLE: [ProcInfo; MAX_PROCS] = [ProcInfo {
+    pid: 0, ppid: 0, state: 0,
+    name: [0; 16], cmdline: [0; 64],
+}; MAX_PROCS];
+static mut PROCESS_COUNT: usize = 0;
+
+static mut TOTAL_MEM: u64 = 0;
+static mut FREE_MEM: u64 = 0;
+static mut CPU_FREQ: u32 = 0;
+static mut CPU_COUNT: u32 = 0;
+static mut UPTIME: u64 = 0;
+
+
+#[no_mangle]
+pub extern "C" fn shell_register_process(pid: u32, ppid: u32, state: u8, name: *const u8, cmdline: *const u8) {
+    unsafe {
+        if PROCESS_COUNT >= MAX_PROCS { return; }
+        let p = &mut PROCESS_TABLE[PROCESS_COUNT];
+        p.pid = pid;
+        p.ppid = ppid;
+        p.state = state;
+        for i in 0..16 {
+            p.name[i] = *name.add(i);
+            if p.name[i] == 0 { break; }
+        }
+        for i in 0..64 {
+            p.cmdline[i] = *cmdline.add(i);
+            if p.cmdline[i] == 0 { break; }
+        }
+        PROCESS_COUNT += 1;
+    }
 }
 
-/// Static terminal instance
-static mut TERMINAL: Terminal = Terminal {
-    buffer: [0; MAX_CMD_LEN],
-    pos: 0,
-    history: [HistoryEntry { cmd: [0; MAX_CMD_LEN], len: 0 }; MAX_HISTORY],
-    history_count: 0,
-    history_index: 0,
-    prompt: [0; 64],
-    prompt_len: 0,
-    cwd: [b'/' ; MAX_PATH],
-    cwd_len: 1,
-    env: [EnvVar { name: [0; 64], value: [0; 256] }; 64],
-    env_count: 0,
-    aliases: [Alias { name: [0; 64], cmd: [0; MAX_CMD_LEN] }; 32],
-    alias_count: 0,
-    last_exit_code: 0,
-    fg_color: 15, // White
-    bg_color: 0,  // Black
-    prompt_color: 10, // Bright green
-    user_color: 11,   // Bright cyan
-    host_color: 13,   // Bright magenta
-    path_color: 14,   // Bright yellow
-    processes: [ProcessInfo {
-        pid: 0, ppid: 0, uid: 0, gid: 0, state: b'S',
-        priority: 0, nice: 0, cpu_percent: 0, mem_percent: 0,
-        name: [0; 16], cmdline: [0; 128],
-    }; MAX_PROCESSES],
-    process_count: 0,
-    jobs: [0; 16],
-    job_count: 0,
-    scrollback: [[0; 80]; 1000],
-    scrollback_lines: 0,
-    scrollback_pos: 0,
-    insert_mode: false,
-    echo_enabled: true,
-};
+#[no_mangle]
+pub extern "C" fn shell_set_meminfo(total: u64, free: u64) {
+    unsafe { TOTAL_MEM = total; FREE_MEM = free; }
+}
+
+#[no_mangle]
+pub extern "C" fn shell_set_cpuinfo(freq: u32, count: u32) {
+    unsafe { CPU_FREQ = freq; CPU_COUNT = count; }
+}
+
+#[no_mangle]
+pub extern "C" fn shell_set_uptime(seconds: u64) {
+    unsafe { UPTIME = seconds; }
+}
+
+#[no_mangle]
+pub extern "C" fn shell_clear_procs() {
+    unsafe { PROCESS_COUNT = 0; }
+}
+
+
+fn strlen(s: &[u8]) -> usize {
+    s.iter().position(|&c| c == 0).unwrap_or(s.len())
+}
+
+fn str_eq(a: &[u8], b: &[u8]) -> bool {
+    let la = strlen(a);
+    let lb = strlen(b);
+    la == lb && a[..la] == b[..lb]
+}
+
+fn starts_with(s: &[u8], prefix: &[u8]) -> bool {
+    let ls = strlen(s);
+    let lp = strlen(prefix);
+    ls >= lp && s[..lp] == *prefix
+}
+
+fn copy_bytes(dst: &mut [u8], src: &[u8]) -> usize {
+    let len = core::cmp::min(dst.len(), src.len());
+    dst[..len].copy_from_slice(&src[..len]);
+    if len < dst.len() { dst[len] = 0; }
+    len
+}
+
+fn trim(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = strlen(s);
+    while start < end && (s[start] == b' ' || s[start] == b'\t') { start += 1; }
+    while end > start && (s[end-1] == b' ' || s[end-1] == b'\t' || s[end-1] == b'\n' || s[end-1] == b'\r') { end -= 1; }
+    &s[start..end]
+}
+
+
+fn pb(b: u8) { unsafe { cursor_putchar(b); } }
+
+fn print_bytes(s: &[u8]) {
+    for &b in s { if b == 0 { break; } pb(b); }
+}
+
+fn print_str(s: &str) { print_bytes(s.as_bytes()); }
+
+fn print_color(s: &str, fg: u8) {
+    unsafe { cursor_set_color(fg, 0); }
+    print_str(s);
+    unsafe { cursor_set_color(C_WHITE, 0); }
+}
+
+fn print_num(n: u64) {
+    if n == 0 { pb(b'0'); return; }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut num = n;
+    while num > 0 {
+        buf[i] = b'0' + (num % 10) as u8;
+        i += 1;
+        num /= 10;
+    }
+    while i > 0 { i -= 1; pb(buf[i]); }
+}
+
+fn newline() { pb(b'\n'); }
+
+fn print_prompt() {
+    unsafe {
+        cursor_set_color(C_BGREEN, 0); print_str("root");
+        cursor_set_color(C_WHITE, 0); print_str("@");
+        cursor_set_color(C_BCYAN, 0); print_str("linuxab");
+        cursor_set_color(C_WHITE, 0); print_str(":");
+        cursor_set_color(C_BYELLOW, 0); print_bytes(&CWD[..CWD_LEN]);
+        cursor_set_color(C_WHITE, 0); print_str("# ");
+        cursor_set_color(C_WHITE, 0);
+    }
+}
+
+
+fn parse_args(input: &[u8], args: &mut [[u8; 64]; MAX_ARGS], lens: &mut [usize; MAX_ARGS]) -> usize {
+    let mut i = 0;
+    let mut arg_count = 0;
+    let len = input.len();
+    while i < len && arg_count < MAX_ARGS {
+        while i < len && (input[i] == b' ' || input[i] == b'\t') { i += 1; }
+        if i >= len { break; }
+        let mut in_quote = false;
+        let mut quote_char = 0u8;
+        let mut j = 0;
+        while i < len && j < 63 {
+            let c = input[i];
+            if !in_quote && (c == b'"' || c == b'\'') {
+                in_quote = true;
+                quote_char = c;
+                i += 1;
+                continue;
+            }
+            if in_quote && c == quote_char {
+                in_quote = false;
+                i += 1;
+                continue;
+            }
+            if !in_quote && (c == b' ' || c == b'\t') { break; }
+            args[arg_count][j] = c;
+            j += 1;
+            i += 1;
+        }
+        lens[arg_count] = j;
+        arg_count += 1;
+        if in_quote {
+            while i < len { i += 1; }
+        }
+    }
+    arg_count
+}
+
+
+fn fs_init() {
+    unsafe {
+        FILES[0].used = true;
+        FILES[0].is_dir = true;
+        copy_bytes(&mut FILES[0].path, b"/");
+
+        fs_mkdir(b"/etc");
+        fs_mkdir(b"/bin");
+        fs_mkdir(b"/home");
+        fs_mkdir(b"/root");
+        fs_mkdir(b"/tmp");
+        fs_mkdir(b"/var");
+        fs_mkdir(b"/usr");
+        fs_mkdir(b"/usr/local");
+
+        fs_write(b"/etc/hostname", b"linuxab-pc");
+        fs_write(b"/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\nguest:x:1000:1000:guest:/home/guest:/bin/sh");
+        fs_write(b"/etc/motd", b"Welcome to linuxab OS!\nType 'help' for commands.\nType 'neofetch' for system info.");
+        fs_write(b"/home/readme.txt", b"This is your home directory.\nUse 'write <file> <text>' to create files.\nUse 'ls' to list.\nUse 'cat' to read.");
+        fs_write(b"/root/.bashrc", b"export PATH=/bin:/usr/bin:/usr/local/bin\nexport HOME=/root\nalias ll='ls -l'\nalias la='ls -a'");
+    }
+}
+
+fn fs_find(path: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_FILES {
+            if FILES[i].used && str_eq(&FILES[i].path, path) {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+fn fs_find_free() -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_FILES {
+            if !FILES[i].used { return Some(i); }
+        }
+        None
+    }
+}
+
+fn fs_mkdir(path: &[u8]) -> bool {
+    unsafe {
+        if fs_find(path).is_some() { return false; }
+        if let Some(i) = fs_find_free() {
+            FILES[i].used = true;
+            FILES[i].is_dir = true;
+            FILES[i].size = 0;
+            copy_bytes(&mut FILES[i].path, path);
+            return true;
+        }
+        false
+    }
+}
+
+fn fs_create(path: &[u8]) -> bool {
+    unsafe {
+        if fs_find(path).is_some() { return false; }
+        if let Some(i) = fs_find_free() {
+            FILES[i].used = true;
+            FILES[i].is_dir = false;
+            FILES[i].size = 0;
+            copy_bytes(&mut FILES[i].path, path);
+            return true;
+        }
+        false
+    }
+}
+
+fn fs_write(path: &[u8], data: &[u8]) -> bool {
+    unsafe {
+        if let Some(idx) = fs_find(path) {
+            if FILES[idx].is_dir { return false; }
+            let len = core::cmp::min(data.len(), MAX_FILE_SIZE);
+            FILES[idx].data[..len].copy_from_slice(&data[..len]);
+            FILES[idx].size = len;
+            return true;
+        }
+        if fs_create(path) { return fs_write(path, data); }
+        false
+    }
+}
+
+fn fs_append(path: &[u8], data: &[u8]) -> bool {
+    unsafe {
+        if let Some(idx) = fs_find(path) {
+            if FILES[idx].is_dir { return false; }
+            let avail = MAX_FILE_SIZE - FILES[idx].size;
+            let len = core::cmp::min(data.len(), avail);
+            let off = FILES[idx].size;
+            FILES[idx].data[off..off+len].copy_from_slice(&data[..len]);
+            FILES[idx].size += len;
+            return true;
+        }
+        false
+    }
+}
+
+fn fs_read(path: &[u8]) -> Option<&[u8]> {
+    unsafe {
+        if let Some(idx) = fs_find(path) {
+            if FILES[idx].is_dir { return None; }
+            return Some(&FILES[idx].data[..FILES[idx].size]);
+        }
+        None
+    }
+}
+
+fn fs_delete(path: &[u8]) -> bool {
+    unsafe {
+        if let Some(idx) = fs_find(path) {
+            if FILES[idx].is_dir {
+                let prefix_len = strlen(&FILES[idx].path);
+                for j in 0..MAX_FILES {
+                    if j == idx || !FILES[j].used { continue; }
+                    if starts_with(&FILES[j].path, &FILES[idx].path[..prefix_len]) {
+                        let cl = strlen(&FILES[j].path);
+                        if cl > prefix_len && FILES[j].path[prefix_len] == b'/' {
+                            fs_delete(&FILES[j].path);
+                        }
+                    }
+                }
+            }
+            FILES[idx].used = false;
+            FILES[idx].size = 0;
+            return true;
+        }
+        false
+    }
+}
+
+fn path_normalize(cwd: &[u8], input: &[u8]) -> [u8; MAX_PATH] {
+    let mut out = [0u8; MAX_PATH];
+    let mut o = 0;
+    if !input.is_empty() && input[0] == b'/' {
+        let len = core::cmp::min(input.len(), MAX_PATH - 1);
+        out[..len].copy_from_slice(&input[..len]);
+        o = len;
+    } else {
+        let cwd_len = strlen(cwd);
+        out[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
+        o = cwd_len;
+        if o > 0 && out[o - 1] != b'/' && o < MAX_PATH - 1 {
+            out[o] = b'/';
+            o += 1;
+        }
+        let in_len = strlen(input);
+        let to_copy = core::cmp::min(in_len, MAX_PATH - o - 1);
+        out[o..o + to_copy].copy_from_slice(&input[..to_copy]);
+        o += to_copy;
+    }
+    out[o] = 0;
+
+    // Resolve . and ..
+    let mut s = 0;
+    let mut d = 0;
+    let mut tmp = [0u8; MAX_PATH];
+    while out[s] != 0 && s < MAX_PATH {
+        // Check /.
+        if out[s] == b'/' && out[s + 1] == b'.' && (out[s + 2] == b'/' || out[s + 2] == 0) {
+            s += 2;
+            if out[s] == b'/' { s += 1; }
+            continue;
+        }
+        // Check /..
+        if out[s] == b'/' && out[s + 1] == b'.' && out[s + 2] == b'.' && (out[s + 3] == b'/' || out[s + 3] == 0) {
+            s += 3;
+            if out[s] == b'/' { s += 1; }
+            // Remove trailing slash if present
+            if d > 0 && tmp[d - 1] == b'/' { d -= 1; }
+            // Remove previous component
+            while d > 0 && tmp[d - 1] != b'/' { d -= 1; }
+            continue;
+        }
+        tmp[d] = out[s];
+        d += 1;
+        s += 1;
+    }
+    if d == 0 { tmp[d] = b'/'; d += 1; }
+    tmp[d] = 0;
+
+    let mut result = [0u8; MAX_PATH];
+    result[..d].copy_from_slice(&tmp[..d]);
+    result
+}
+
+
+fn sys_reboot() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "mov al, 0xFE",
+            "out 0x64, al",
+            "1: hlt",
+            "jmp 1b",
+            options(noreturn)
+        );
+    }
+}
+
+fn sys_halt() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "1: hlt",
+            "jmp 1b",
+            options(noreturn)
+        );
+    }
+}
+
+// ============================================================================
+// COMMAND IMPLEMENTATIONS
+// ============================================================================
+fn cmd_help() {
+    print_color("=== linuxab Real Shell ===\n", C_BCYAN);
+    print_str("System : help clear reboot shutdown halt uname version uptime date\n");
+    print_str("         mem cpu ps kill dmesg whoami hostname neofetch\n");
+    print_str("Files  : ls cat cd pwd touch mkdir rm write append\n");
+    print_str("Shell  : echo history alias unalias export env source exec\n");
+    newline();
+}
+
+fn cmd_clear() {
+    unsafe { cursor_clear_screen(); }
+}
+
+fn cmd_reboot() {
+    print_color("Rebooting...\n", C_BRED);
+    sys_reboot();
+}
+
+fn cmd_shutdown() {
+    print_color("Shutting down...\n", C_BRED);
+    sys_halt();
+}
+
+fn cmd_halt() {
+    print_color("Halting CPU...\n", C_BRED);
+    sys_halt();
+}
+
+fn cmd_uname() {
+    print_str("linuxab\n");
+}
+
+fn cmd_version() {
+    print_str("linuxab OS v0.1.0 (realProxik)\n");
+    print_str("License: GPL-2.0\n");
+}
+
+fn cmd_uptime() {
+    unsafe {
+        let s = UPTIME;
+        print_num(s / 3600); print_str("h ");
+        print_num((s % 3600) / 60); print_str("m ");
+        print_num(s % 60); print_str("s\n");
+    }
+}
+
+fn cmd_date() {
+    print_str("Sat Jan 01 00:00:00 UTC 2026\n");
+    print_str("(Wire RTC driver for real time)\n");
+}
+
+fn cmd_mem() {
+    unsafe {
+        print_str("total: "); print_num(TOTAL_MEM / 1024); print_str(" KB\n");
+        print_str("free:  "); print_num(FREE_MEM / 1024); print_str(" KB\n");
+        print_str("used:  "); print_num((TOTAL_MEM - FREE_MEM) / 1024); print_str(" KB\n");
+    }
+}
+
+fn cmd_cpu() {
+    unsafe {
+        print_str("cpus: "); print_num(CPU_COUNT as u64); newline();
+        print_str("freq: "); print_num(CPU_FREQ as u64); print_str(" MHz\n");
+    }
+}
+
+fn cmd_ps() {
+    unsafe {
+        if PROCESS_COUNT == 0 {
+            print_str("No processes. Wire kernel to shell_register_process().\n");
+            return;
+        }
+        print_color("PID   PPID  S NAME             CMDLINE\n", C_BCYAN);
+        for i in 0..PROCESS_COUNT {
+            let p = &PROCESS_TABLE[i];
+            print_num(p.pid as u64); print_str("    ");
+            print_num(p.ppid as u64); print_str("    ");
+            pb(p.state); print_str(" ");
+            print_bytes(&p.name); print_str("  ");
+            print_bytes(&p.cmdline); newline();
+        }
+    }
+}
+
+fn cmd_kill(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 {
+        print_str("usage: kill <pid> [sig]\n");
+        return;
+    }
+    let pid = parse_u32(&args[1], lens[1]);
+    let sig = if count > 2 { parse_u32(&args[2], lens[2]) } else { 9 };
+    print_str("kill: sig "); print_num(sig as u64);
+    print_str(" -> pid "); print_num(pid as u64); newline();
+    print_str("(Wire kernel_kill() for real signal delivery)\n");
+}
+
+fn cmd_dmesg() {
+    print_str("(Wire kernel_dmesg() to read printk ring buffer)\n");
+}
+
+fn cmd_whoami() {
+    print_str("root\n");
+}
+
+fn cmd_hostname() {
+    if let Some(data) = fs_read(b"/etc/hostname") {
+        print_bytes(data); newline();
+    } else {
+        print_str("linuxab-pc\n");
+    }
+}
+
+fn cmd_neofetch() {
+    print_color("       _                _     \n", C_BCYAN);
+    print_color("      | |              | |    \n", C_BCYAN);
+    print_color("      | |  _ __   __ _ | |__  \n", C_BCYAN);
+    print_color("  _   | | | '_ \\ / _` || '_ \\ \n", C_BCYAN);
+    print_color(" | |__| | | | | | (_| || |_) |\n", C_BCYAN);
+    print_color("  \\____/  |_| |_|\\__,_||_.__/ \n", C_BCYAN);
+    newline();
+    print_str("OS:      linuxab\n");
+    print_str("Kernel:  0.1.0\n");
+    print_str("Shell:   terl\n");
+    print_str("User:    root\n");
+    print_str("Uptime:  "); cmd_uptime();
+    print_str("Memory:  "); cmd_mem();
+    print_str("CPU:     "); cmd_cpu();
+}
+
+// ============================================================================
+// FILE COMMANDS
+// ============================================================================
+fn cmd_ls(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    unsafe {
+        let target = if count > 1 {
+            path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]])
+        } else {
+            let mut t = [0u8; MAX_PATH];
+            t[..CWD_LEN].copy_from_slice(&CWD[..CWD_LEN]);
+            t
+        };
+        let prefix_len = strlen(&target);
+        let mut found = false;
+        for i in 0..MAX_FILES {
+            if !FILES[i].used { continue; }
+            let p = &FILES[i].path;
+            let plen = strlen(p);
+            if plen < prefix_len || p[..prefix_len] != target[..prefix_len] { continue; }
+            if plen == prefix_len { continue; } // the dir itself
+            let rel = &p[prefix_len..];
+            let rel_trim = if !rel.is_empty() && rel[0] == b'/' { &rel[1..] } else { rel };
+            if rel_trim.iter().position(|&c| c == b'/').is_some() { continue; }
+            if FILES[i].is_dir {
+                print_color("[dir]  ", C_BCYAN);
+            } else {
+                print_color("[file] ", C_GREEN);
+            }
+            print_bytes(rel_trim); newline();
+            found = true;
+        }
+        if !found { print_str("total 0\n"); }
+    }
+}
+
+fn cmd_cat(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { print_str("usage: cat <file>\n"); return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        if let Some(data) = fs_read(&path) {
+            print_bytes(data); newline();
+        } else {
+            print_color("cat: no such file\n", C_BRED);
+        }
+    }
+}
+
+fn cmd_cd(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 {
+        unsafe { CWD_LEN = 1; CWD[0] = b'/'; }
+        return;
+    }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        if let Some(idx) = fs_find(&path) {
+            if FILES[idx].is_dir {
+                let plen = strlen(&path);
+                CWD[..plen].copy_from_slice(&path[..plen]);
+                CWD_LEN = plen;
+                if CWD_LEN > 0 && CWD[CWD_LEN - 1] != b'/' && CWD_LEN < MAX_PATH - 1 {
+                    CWD[CWD_LEN] = b'/';
+                    CWD_LEN += 1;
+                }
+            } else {
+                print_color("cd: not a directory\n", C_BRED);
+            }
+        } else {
+            print_color("cd: no such file or directory\n", C_BRED);
+        }
+    }
+}
+
+fn cmd_pwd() {
+    unsafe { print_bytes(&CWD[..CWD_LEN]); newline(); }
+}
+
+fn cmd_touch(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        if fs_find(&path).is_none() { fs_create(&path); }
+    }
+}
+
+fn cmd_mkdir(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        fs_mkdir(&path);
+    }
+}
+
+fn cmd_rm(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { print_str("usage: rm <file/dir>\n"); return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        if !fs_delete(&path) {
+            print_color("rm: cannot remove\n", C_BRED);
+        }
+    }
+}
+
+fn cmd_write(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 3 { print_str("usage: write <file> <text...>\n"); return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        let mut buf = [0u8; MAX_FILE_SIZE];
+        let mut off = 0;
+        for i in 2..count {
+            if off > 0 && off < MAX_FILE_SIZE - 1 { buf[off] = b' '; off += 1; }
+            let to_copy = core::cmp::min(lens[i], MAX_FILE_SIZE - off - 1);
+            buf[off..off + to_copy].copy_from_slice(&args[i][..to_copy]);
+            off += to_copy;
+        }
+        fs_write(&path, &buf[..off]);
+    }
+}
+
+fn cmd_append(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 3 { print_str("usage: append <file> <text...>\n"); return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        let mut buf = [0u8; MAX_FILE_SIZE];
+        let mut off = 0;
+        for i in 2..count {
+            if off > 0 && off < MAX_FILE_SIZE - 1 { buf[off] = b' '; off += 1; }
+            let to_copy = core::cmp::min(lens[i], MAX_FILE_SIZE - off - 1);
+            buf[off..off + to_copy].copy_from_slice(&args[i][..to_copy]);
+            off += to_copy;
+        }
+        fs_append(&path, &buf[..off]);
+    }
+}
+
+fn cmd_echo(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    for i in 1..count {
+        print_bytes(&args[i][..lens[i]]);
+        if i < count - 1 { pb(b' '); }
+    }
+    newline();
+}
+
+fn cmd_history() {
+    unsafe {
+        if HISTORY_COUNT == 0 { print_str("No history.\n"); return; }
+        for i in 0..HISTORY_COUNT {
+            print_num((i + 1) as u64); print_str("  ");
+            print_bytes(&HISTORY[i].cmd[..HISTORY[i].len]); newline();
+        }
+    }
+}
+
+fn cmd_alias(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    unsafe {
+        if count < 2 {
+            for i in 0..ALIAS_COUNT {
+                print_bytes(&ALIASES[i].name); print_str("='");
+                print_bytes(&ALIASES[i].cmd[..ALIASES[i].len]); print_str("'\n");
+            }
+            return;
+        }
+        if ALIAS_COUNT >= MAX_ALIAS { print_color("alias: table full\n", C_BRED); return; }
+        let nl = core::cmp::min(lens[1], 31);
+        ALIASES[ALIAS_COUNT].name[..nl].copy_from_slice(&args[1][..nl]);
+        ALIASES[ALIAS_COUNT].name[nl] = 0;
+        let mut off = 0;
+        for i in 2..count {
+            if off > 0 && off < MAX_CMD_LEN - 1 { ALIASES[ALIAS_COUNT].cmd[off] = b' '; off += 1; }
+            let tc = core::cmp::min(lens[i], MAX_CMD_LEN - off - 1);
+            ALIASES[ALIAS_COUNT].cmd[off..off + tc].copy_from_slice(&args[i][..tc]);
+            off += tc;
+        }
+        ALIASES[ALIAS_COUNT].len = off;
+        ALIAS_COUNT += 1;
+    }
+}
+
+fn cmd_unalias(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            if str_eq(&ALIASES[i].name, &args[1][..lens[1]]) {
+                for j in i..ALIAS_COUNT - 1 { ALIASES[j] = ALIASES[j + 1]; }
+                ALIAS_COUNT -= 1;
+                return;
+            }
+        }
+    }
+}
+
+fn cmd_export(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    let arg = &args[1][..lens[1]];
+    if let Some(pos) = arg.iter().position(|&c| c == b'=') {
+        let name = &arg[..pos];
+        let value = &arg[pos + 1..];
+        unsafe {
+            if ENV_COUNT >= MAX_ENV { return; }
+            let nl = core::cmp::min(name.len(), 31);
+            let vl = core::cmp::min(value.len(), 63);
+            ENV[ENV_COUNT].name[..nl].copy_from_slice(&name[..nl]);
+            ENV[ENV_COUNT].name[nl] = 0;
+            ENV[ENV_COUNT].value[..vl].copy_from_slice(&value[..vl]);
+            ENV[ENV_COUNT].value[vl] = 0;
+            ENV_COUNT += 1;
+        }
+    }
+}
+
+fn cmd_env() {
+    unsafe {
+        for i in 0..ENV_COUNT {
+            print_bytes(&ENV[i].name); print_str("=");
+            print_bytes(&ENV[i].value); newline();
+        }
+    }
+}
+
+fn cmd_source(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    unsafe {
+        let path = path_normalize(&CWD[..CWD_LEN], &args[1][..lens[1]]);
+        if let Some(data) = fs_read(&path) {
+            let mut line = [0u8; MAX_CMD_LEN];
+            let mut li = 0;
+            for &b in data {
+                if b == b'\n' {
+                    if li > 0 { execute_line(&line[..li]); }
+                    line = [0u8; MAX_CMD_LEN];
+                    li = 0;
+                } else if li < MAX_CMD_LEN - 1 {
+                    line[li] = b;
+                    li += 1;
+                }
+            }
+            if li > 0 { execute_line(&line[..li]); }
+        } else {
+            print_color("source: file not found\n", C_BRED);
+        }
+    }
+}
+
+fn cmd_exec(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    if count < 2 { return; }
+    print_str("exec: ELF loader not yet wired.\n");
+    print_str("Implement ELF parsing + page allocation + jump to userland.\n");
+}
+
+
+
+fn parse_u32(s: &[u8], len: usize) -> u32 {
+    let mut n = 0u32;
+    for i in 0..len {
+        if s[i] >= b'0' && s[i] <= b'9' {
+            n = n * 10 + (s[i] - b'0') as u32;
+        }
+    }
+    n
+}
+
+fn resolve_alias(name: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            if str_eq(&ALIASES[i].name, name) { return Some(i); }
+        }
+        None
+    }
+}
+
+// ============================================================================
+// EXECUTION ENGINE
+// ============================================================================
+fn execute_line(line: &[u8]) {
+    let trimmed = trim(line);
+    if trimmed.is_empty() { return; }
+    unsafe {
+        if HISTORY_COUNT < MAX_HISTORY {
+            let len = core::cmp::min(trimmed.len(), MAX_CMD_LEN);
+            HISTORY[HISTORY_COUNT].cmd[..len].copy_from_slice(&trimmed[..len]);
+            HISTORY[HISTORY_COUNT].len = len;
+            HISTORY_COUNT += 1;
+        }
+    }
+    let mut args = [[0u8; 64]; MAX_ARGS];
+    let mut lens = [0usize; MAX_ARGS];
+    let count = parse_args(trimmed, &mut args, &mut lens);
+    if count == 0 { return; }
+
+    let cmd = &args[0][..lens[0]];
+    if let Some(aidx) = resolve_alias(cmd) {
+        unsafe {
+            let mut new_cmd = [0u8; MAX_CMD_LEN];
+            let mut nc = 0;
+            let alen = ALIASES[aidx].len;
+            new_cmd[..alen].copy_from_slice(&ALIASES[aidx].cmd[..alen]);
+            nc = alen;
+            for i in 1..count {
+                if nc < MAX_CMD_LEN - 1 { new_cmd[nc] = b' '; nc += 1; }
+                let tc = core::cmp::min(lens[i], MAX_CMD_LEN - nc);
+                new_cmd[nc..nc + tc].copy_from_slice(&args[i][..tc]);
+                nc += tc;
+            }
+            let mut a2 = [[0u8; 64]; MAX_ARGS];
+            let mut l2 = [0usize; MAX_ARGS];
+            let c2 = parse_args(&new_cmd[..nc], &mut a2, &mut l2);
+            if c2 > 0 { dispatch(&a2, &l2, c2); }
+        }
+        return;
+    }
+    dispatch(&args, &lens, count);
+}
+
+fn dispatch(args: &[[u8; 64]], lens: &[usize], count: usize) {
+    let c = &args[0][..lens[0]];
+    if str_eq(c, b"help") { cmd_help(); }
+    else if str_eq(c, b"clear") { cmd_clear(); }
+    else if str_eq(c, b"reboot") { cmd_reboot(); }
+    else if str_eq(c, b"shutdown") { cmd_shutdown(); }
+    else if str_eq(c, b"halt") { cmd_halt(); }
+    else if str_eq(c, b"uname") { cmd_uname(); }
+    else if str_eq(c, b"version") { cmd_version(); }
+    else if str_eq(c, b"uptime") { cmd_uptime(); }
+    else if str_eq(c, b"date") { cmd_date(); }
+    else if str_eq(c, b"mem") || str_eq(c, b"free") { cmd_mem(); }
+    else if str_eq(c, b"cpu") { cmd_cpu(); }
+    else if str_eq(c, b"ps") { cmd_ps(); }
+    else if str_eq(c, b"kill") { cmd_kill(args, lens, count); }
+    else if str_eq(c, b"dmesg") { cmd_dmesg(); }
+    else if str_eq(c, b"whoami") { cmd_whoami(); }
+    else if str_eq(c, b"hostname") { cmd_hostname(); }
+    else if str_eq(c, b"neofetch") { cmd_neofetch(); }
+    else if str_eq(c, b"ls") { cmd_ls(args, lens, count); }
+    else if str_eq(c, b"cat") { cmd_cat(args, lens, count); }
+    else if str_eq(c, b"cd") { cmd_cd(args, lens, count); }
+    else if str_eq(c, b"pwd") { cmd_pwd(); }
+    else if str_eq(c, b"touch") { cmd_touch(args, lens, count); }
+    else if str_eq(c, b"mkdir") { cmd_mkdir(args, lens, count); }
+    else if str_eq(c, b"rm") { cmd_rm(args, lens, count); }
+    else if str_eq(c, b"write") { cmd_write(args, lens, count); }
+    else if str_eq(c, b"append") { cmd_append(args, lens, count); }
+    else if str_eq(c, b"echo") { cmd_echo(args, lens, count); }
+    else if str_eq(c, b"history") { cmd_history(); }
+    else if str_eq(c, b"alias") { cmd_alias(args, lens, count); }
+    else if str_eq(c, b"unalias") { cmd_unalias(args, lens, count); }
+    else if str_eq(c, b"export") { cmd_export(args, lens, count); }
+    else if str_eq(c, b"env") { cmd_env(); }
+    else if str_eq(c, b"source") { cmd_source(args, lens, count); }
+    else if str_eq(c, b"exec") { cmd_exec(args, lens, count); }
+    else {
+        print_color("terl: command not found: ", C_BRED);
+        print_bytes(c); newline();
+        print_str("Type 'help' for available commands.\n");
+    }
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+pub struct Terminal;
 
 impl Terminal {
-    pub fn new() -> &'static mut Terminal {
-        unsafe { &mut TERMINAL }
+    pub fn new() -> Self { Terminal }
+
+    pub fn init(&self) {
+        unsafe { cursor_init(); cursor_clear_screen(); }
+        fs_init();
+        print_color("linuxab OS v0.1.0\n", C_BGREEN);
+        print_str("Type 'help' for commands. Type 'neofetch' for info.\n---\n");
+        print_prompt();
     }
-    
-    /// Initialize terminal
-    pub fn init(&mut self) {
+
+    /// Call this from keyboard interrupt handler for each keypress
+    pub fn input(&self, c: u8) {
+        static mut BUF: [u8; MAX_CMD_LEN] = [0; MAX_CMD_LEN];
+        static mut POS: usize = 0;
         unsafe {
-            cursor_init();
-            cursor_clear_screen();
-        }
-        
-        // Set default environment
-        self.set_env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin");
-        self.set_env("HOME", "/root");
-        self.set_env("USER", "root");
-        self.set_env("SHELL", "/bin/bash");
-        self.set_env("TERM", "xterm-256color");
-        self.set_env("LANG", "en_US.UTF-8");
-        self.set_env("EDITOR", "vim");
-        self.set_env("PAGER", "less");
-        self.set_env("PS1", "\\u@\\h:\\w\\$ ");
-        self.set_env("HISTSIZE", "1000");
-        self.set_env("HOSTNAME", "myos-pc");
-        self.set_env("XDG_SESSION_TYPE", "tty");
-        self.set_env("XDG_CURRENT_DESKTOP", "MyOS-Desktop");
-        
-        // Set default aliases
-        self.set_alias("ls", "ls --color=auto");
-        self.set_alias("ll", "ls -alF");
-        self.set_alias("la", "ls -A");
-        self.set_alias("l", "ls -CF");
-        self.set_alias("dir", "ls --color=auto --format=vertical");
-        self.set_alias("vdir", "ls --color=auto --format=long");
-        self.set_alias("grep", "grep --color=auto");
-        self.set_alias("fgrep", "fgrep --color=auto");
-        self.set_alias("egrep", "egrep --color=auto");
-        self.set_alias("cp", "cp -i");
-        self.set_alias("mv", "mv -i");
-        self.set_alias("rm", "rm -i");
-        self.set_alias("mkdir", "mkdir -pv");
-        self.set_alias("df", "df -h");
-        self.set_alias("du", "du -h");
-        self.set_alias("free", "free -h");
-        self.set_alias("ps", "ps aux");
-        self.set_alias("update", "pacman -Syu 2>/dev/null || apt update && apt upgrade 2>/dev/null || emerge --sync 2>/dev/null");
-        
-        // Initialize fake processes
-        self.init_processes();
-        
-        self.update_prompt();
-        self.print_prompt();
-    }
-    
-    /// Initialize fake process table
-    fn init_processes(&mut self) {
-        let procs = [
-            (1, 0, b"systemd\0", b"/sbin/init\0", b'R', 0, 20),
-            (2, 1, b"kthreadd\0", b"[kthreadd]\0", b'S', -5, 0),
-            (3, 2, b"ksoftirqd\0", b"[ksoftirqd/0]\0", b'S', 0, 0),
-            (4, 2, b"kworker\0", b"[kworker/0:0]\0", b'S', 0, 0),
-            (5, 2, b"kworker\0", b"[kworker/0:1]\0", b'S', 0, 0),
-            (10, 1, b"systemd-journal\0", b"/usr/lib/systemd/systemd-journald\0", b'S', 0, 10),
-            (15, 1, b"systemd-udevd\0", b"/usr/lib/systemd/systemd-udevd\0", b'S', 0, 15),
-            (100, 1, b"dbus-daemon\0", b"/usr/bin/dbus-daemon --system\0", b'S', 0, 5),
-            (150, 1, b"NetworkManager\0", b"/usr/bin/NetworkManager --no-daemon\0", b'S', 0, 20),
-            (200, 1, b"sshd\0", b"/usr/bin/sshd -D\0", b'S', 0, 10),
-            (250, 1, b"cron\0", b"/usr/sbin/cron -f\0", b'S', 0, 5),
-            (300, 1, b"bash\0", b"-bash\0", b'R', 0, 50),
-            (301, 300, b"vim\0", b"vim /etc/fstab\0", b'S', 0, 30),
-            (302, 300, b"top\0", b"top\0", b'R', 0, 25),
-            (400, 1, b"Xorg\0", b"/usr/lib/Xorg :0 -seat seat0\0", b'S', 0, 200),
-            (450, 400, b"desktop-env\0", b"/usr/bin/myos-desktop\0", b'S', 0, 300),
-            (500, 450, b"terminal\0", b"/usr/bin/myos-terminal\0", b'R', 0, 80),
-            (501, 500, b"bash\0", b"bash\0", b'R', 0, 60),
-            (600, 1, b"firefox\0", b"/usr/lib/firefox/firefox\0", b'S', 0, 500),
-            (700, 1, b"dockerd\0", b"/usr/bin/dockerd -H fd://\0", b'S', 0, 100),
-        ];
-        
-        for (i, (pid, ppid, name, cmdline, state, nice, mem)) in procs.iter().enumerate() {
-            self.processes[i].pid = *pid;
-            self.processes[i].ppid = *ppid;
-            self.processes[i].uid = if *pid < 100 { 0 } else { 1000 };
-            self.processes[i].gid = if *pid < 100 { 0 } else { 1000 };
-            self.processes[i].state = *state;
-            self.processes[i].nice = *nice;
-            self.processes[i].priority = 20 + *nice;
-            self.processes[i].cpu_percent = (*pid % 7) as u8;
-            self.processes[i].mem_percent = *mem as u8;
-            
-            let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            self.processes[i].name[..name_len].copy_from_slice(&name[..name_len]);
-            
-            let cmd_len = cmdline.iter().position(|&b| b == 0).unwrap_or(cmdline.len());
-            self.processes[i].cmdline[..cmd_len].copy_from_slice(&cmdline[..cmd_len]);
-        }
-        
-        self.process_count = procs.len();
-    }
-    
-    /// Update prompt based on PS1
-    fn update_prompt(&mut self) {
-        let ps1 = self.get_env("PS1");
-        let user = self.get_env("USER");
-        let host = self.get_env("HOSTNAME");
-        
-        // Simple PS1 parsing: \u = user, \h = host, \w = cwd, \$ = #/$
-        let mut prompt_idx = 0;
-        
-        // Build colored prompt
-        self.prompt[prompt_idx] = b'[';
-        prompt_idx += 1;
-        
-        // User (cyan)
-        for &b in user.bytes() {
-            if prompt_idx < 60 { self.prompt[prompt_idx] = b; prompt_idx += 1; }
-        }
-        
-        self.prompt[prompt_idx] = b'@';
-        prompt_idx += 1;
-        
-        // Host (magenta)
-        for &b in host.bytes() {
-            if prompt_idx < 60 { self.prompt[prompt_idx] = b; prompt_idx += 1; }
-        }
-        
-        self.prompt[prompt_idx] = b' ';
-        prompt_idx += 1;
-        
-        // Path (yellow)
-        for &b in self.cwd[..self.cwd_len].iter() {
-            if prompt_idx < 60 { self.prompt[prompt_idx] = b; prompt_idx += 1; }
-        }
-        
-        // Root or user prompt
-        self.prompt[prompt_idx] = b']';
-        prompt_idx += 1;
-        self.prompt[prompt_idx] = b'#';
-        prompt_idx += 1;
-        self.prompt[prompt_idx] = b' ';
-        prompt_idx += 1;
-        
-        self.prompt_len = prompt_idx;
-    }
-    
-    /// Print prompt with colors
-    pub fn print_prompt(&mut self) {
-        unsafe {
-            cursor_set_color(self.user_color, self.bg_color);
-            cursor_print(b"[".as_ptr());
-            
-            // User
-            let user = self.get_env("USER");
-            cursor_print(user.as_bytes().as_ptr());
-            
-            cursor_set_color(15, self.bg_color); // White @
-            cursor_print(b"@".as_ptr());
-            
-            // Host
-            cursor_set_color(self.host_color, self.bg_color);
-            let host = self.get_env("HOSTNAME");
-            cursor_print(host.as_bytes().as_ptr());
-            
-            cursor_set_color(15, self.bg_color);
-            cursor_print(b" ".as_ptr());
-            
-            // Path
-            cursor_set_color(self.path_color, self.bg_color);
-            cursor_print(self.cwd[..self.cwd_len].as_ptr());
-            
-            cursor_set_color(15, self.bg_color);
-            cursor_print(b"]".as_ptr());
-            
-            // # for root, $ for user
-            cursor_set_color(self.prompt_color, self.bg_color);
-            cursor_print(b"# ".as_ptr());
-            
-            cursor_set_color(self.fg_color, self.bg_color);
-        }
-    }
-    
-    /// Print colored text
-    fn print_colored(&self, text: &str, fg: u8) {
-        unsafe {
-            cursor_set_color(fg, self.bg_color);
-            cursor_print(text.as_bytes().as_ptr());
-            cursor_set_color(self.fg_color, self.bg_color);
-        }
-    }
-    
-    /// Print error in red
-    fn print_error(&self, msg: &str) {
-        self.print_colored(msg, 12); // Bright red
-    }
-    
-    /// Print success in green
-    fn print_success(&self, msg: &str) {
-        self.print_colored(msg, 10); // Bright green
-    }
-    
-    /// Print info in cyan
-    fn print_info(&self, msg: &str) {
-        self.print_colored(msg, 11); // Bright cyan
-    }
-    
-    /// Print warning in yellow
-    fn print_warning(&self, msg: &str) {
-        self.print_colored(msg, 14); // Bright yellow
-    }
-    
-    /// Add line to scrollback
-    fn add_to_scrollback(&mut self, line: &[u8]) {
-        if self.scrollback_lines < 1000 {
-            let len = core::cmp::min(line.len(), 80);
-            self.scrollback[self.scrollback_lines][..len].copy_from_slice(&line[..len]);
-            self.scrollback_lines += 1;
-        } else {
-            // Shift scrollback
-            for i in 0..999 {
-                self.scrollback[i] = self.scrollback[i + 1];
-            }
-            let len = core::cmp::min(line.len(), 80);
-            self.scrollback[999][..len].copy_from_slice(&line[..len]);
-        }
-    }
-    
-    /// Process input character
-    pub fn input(&mut self, c: u8) {
-        match c {
-            b'\n' | b'\r' => {
-                self.execute();
-                self.buffer = [0; MAX_CMD_LEN];
-                self.pos = 0;
-                self.print_prompt();
-            }
-            b'\x7F' | b'\x08' => {  // Backspace
-                if self.pos > 0 {
-                    self.pos -= 1;
-                    self.buffer[self.pos] = 0;
-                    unsafe {
-                        cursor_move(-1, 0);
-                        cursor_putchar(b' ');
-                        cursor_move(-1, 0);
+            match c {
+                b'\n' | b'\r' => {
+                    pb(b'\n');
+                    if POS > 0 { execute_line(&BUF[..POS]); }
+                    POS = 0;
+                    BUF = [0; MAX_CMD_LEN];
+                    print_prompt();
+                }
+                0x7F | 0x08 => { // Backspace
+                    if POS > 0 {
+                        POS -= 1;
+                        BUF[POS] = 0;
+                        pb(0x08); pb(b' '); pb(0x08);
                     }
                 }
-            }
-            b'\t' => {  // Tab completion
-                self.complete();
-            }
-            0x1B => {  // Escape - handle sequences in next chars
-                // TODO: Handle arrow keys, F-keys
-                // For now, skip next 2 chars (simplified)
-            }
-            0x00..=0x1F => {
-                // Control characters - handle special ones
-                match c {
-                    0x03 => { // Ctrl+C
-                        self.buffer = [0; MAX_CMD_LEN];
-                        self.pos = 0;
-                        unsafe {
-                            cursor_putchar(b'\n');
-                        }
-                        self.print_prompt();
-                    }
-                    0x04 => { // Ctrl+D (EOF)
-                        if self.pos == 0 {
-                            self.cmd_exit(&[]);
-                        }
-                    }
-                    0x0C => { // Ctrl+L (clear)
-                        unsafe { cursor_clear_screen(); }
-                        self.print_prompt();
-                    }
-                    0x15 => { // Ctrl+U (clear line)
-                        self.pos = 0;
-                        self.buffer = [0; MAX_CMD_LEN];
-                        unsafe {
-                            cursor_set_pos(0, 24); // Move to start of line
-                            // Clear line
-                            for _ in 0..80 {
-                                cursor_putchar(b' ');
-                            }
-                            cursor_set_pos(0, 24);
-                        }
-                        self.print_prompt();
-                    }
-                    0x0E => { // Ctrl+N (next history)
-                        self.next_history();
-                    }
-                    0x10 => { // Ctrl+P (prev history)
-                        self.prev_history();
-                    }
-                    0x01 => { // Ctrl+A (beginning of line)
-                        self.pos = 0;
-                        // TODO: Update cursor position
-                    }
-                    0x05 => { // Ctrl+E (end of line)
-                        self.pos = self.buffer.iter().position(|&b| b == 0).unwrap_or(0);
-                        // TODO: Update cursor position
-                    }
-                    _ => {}
+                0x03 => { // Ctrl+C
+                    POS = 0; BUF = [0; MAX_CMD_LEN];
+                    pb(b'\n'); print_prompt();
                 }
-            }
-            _ if c >= 0x20 && c < 0x7F => {
-                if self.pos < MAX_CMD_LEN - 1 {
-                    if self.insert_mode && self.buffer[self.pos] != 0 {
-                        // Insert mode - shift right
-                        unsafe { cursor_insert_char(c); }
-                        // Shift buffer
-                        for i in (self.pos..MAX_CMD_LEN-1).rev() {
-                            self.buffer[i+1] = self.buffer[i];
-                        }
-                    } else {
-                        unsafe { cursor_putchar(c); }
-                    }
-                    self.buffer[self.pos] = c;
-                    self.pos += 1;
+                0x0C => { // Ctrl+L
+                    cursor_clear_screen();
+                    print_prompt();
                 }
-            }
-            _ => {}
-        }
-    }
-    
-    /// Tab completion
-    fn complete(&mut self) {
-        let partial = core::str::from_utf8(&self.buffer[..self.pos]).unwrap_or("");
-        let parts: Vec<&str> = partial.split_whitespace().collect();
-        
-        if parts.is_empty() {
-            return;
-        }
-        
-        // Complete command or filename
-        let to_complete = parts.last().unwrap();
-        
-        // Check commands
-        let commands = [
-            "pacman", "yay", "apt", "apt-get", "dpkg", "snap",
-            "emerge", "equery", "eselect", "portageq",
-            "ls", "cd", "pwd", "cat", "touch", "mkdir", "rm", "cp", "mv",
-            "chmod", "chown", "ln", "find", "locate", "which", "whereis",
-            "ps", "top", "htop", "free", "uptime", "uname", "whoami", "id",
-            "groups", "hostname", "date", "cal", "time",
-            "ping", "ifconfig", "ip", "netstat", "ss", "curl", "wget", "ssh",
-            "git", "grep", "awk", "sed", "wc", "sort", "uniq", "head", "tail",
-            "cut", "tr", "diff", "patch", "xargs",
-            "kill", "killall", "nice", "nohup", "jobs", "fg", "bg",
-            "nano", "vim", "vi",
-            "echo", "clear", "exit", "reboot", "shutdown", "mount", "umount",
-            "df", "du", "tar", "gzip", "gunzip", "zip", "unzip",
-            "bash", "sh", "source", "export", "alias", "unalias", "history",
-            "help", "neofetch", "screenfetch", "cowsay", "sl", "fortune",
-            "tree", "watch", "seq", "yes", "rev", "tac", "shuf",
-            "base64", "md5sum", "sha256sum", "xxd", "hexdump", "od",
-            "strace", "ltrace", "perf", "dmesg", "journalctl",
-            "systemctl", "service", "chkconfig", "update-rc.d",
-            "useradd", "usermod", "userdel", "passwd", "su", "sudo",
-            "adduser", "deluser", "addgroup", "delgroup",
-            "apt-cache", "apt-file", "apt-mark", "apt-listbugs",
-            "pacman-key", "makepkg", "pkgbuild", "aur",
-            "ebuild", "quickpkg", "revdep-rebuild", "eclean",
-            "dnf", "yum", "rpm", "zypper", "apk",
-            "docker", "podman", "kubectl", "helm",
-            "gcc", "g++", "make", "cmake", "ninja", "cargo", "rustc",
-            "python", "python3", "node", "npm", "ruby", "perl", "php",
-            "ssh-keygen", "ssh-copy-id", "scp", "rsync", "sftp",
-            "nc", "nmap", "tcpdump", "wireshark", "tshark",
-            "openssl", "gpg", "gpg2", "pass",
-            "tmux", "screen", "byobu",
-            "htop", "btop", "gtop", "vtop", "gotop",
-            "ranger", "nnn", "mc", "vifm",
-            "fzf", "ripgrep", "fd", "bat", "exa", "lsd",
-            "zoxide", "starship", "oh-my-zsh",
-        ];
-        
-        let mut matches: [&str; 32] = [""; 32];
-        let mut match_count = 0;
-        
-        for &cmd in &commands {
-            if cmd.starts_with(to_complete) {
-                if match_count < 32 {
-                    matches[match_count] = cmd;
-                    match_count += 1;
-                }
-            }
-        }
-        
-        if match_count == 1 {
-            // Single match - complete it
-            let completion = matches[0];
-            let completed_len = to_complete.len();
-            let remaining = &completion[completed_len..];
-            
-            for &b in remaining.bytes() {
-                if self.pos < MAX_CMD_LEN - 1 {
-                    self.buffer[self.pos] = b;
-                    self.pos += 1;
-                    unsafe { cursor_putchar(b); }
-                }
-            }
-            
-            // Add space after command
-            if self.pos < MAX_CMD_LEN - 1 {
-                self.buffer[self.pos] = b' ';
-                self.pos += 1;
-                unsafe { cursor_putchar(b' '); }
-            }
-        } else if match_count > 1 {
-            // Multiple matches - show options
-            unsafe { cursor_putchar(b'\n'); }
-            for i in 0..match_count {
-                kprint!("{}  ", matches[i]);
-                if (i + 1) % 4 == 0 {
-                    kprint!("\n");
-                }
-            }
-            kprint!("\n");
-            self.print_prompt();
-            // Reprint partial command
-            for i in 0..self.pos {
-                unsafe { cursor_putchar(self.buffer[i]); }
-            }
-        }
-    }
-    
-    /// Previous history
-    fn prev_history(&mut self) {
-        if self.history_count == 0 || self.history_index == 0 {
-            return;
-        }
-        
-        self.history_index -= 1;
-        let entry = &self.history[self.history_index];
-        
-        // Clear current line
-        self.pos = 0;
-        self.buffer = [0; MAX_CMD_LEN];
-        
-        // Copy history entry
-        let len = core::cmp::min(entry.len, MAX_CMD_LEN - 1);
-        self.buffer[..len].copy_from_slice(&entry.cmd[..len]);
-        self.pos = len;
-        
-        // TODO: Redraw line
-    }
-    
-    /// Next history
-    fn next_history(&mut self) {
-        if self.history_index >= self.history_count {
-            return;
-        }
-        
-        self.history_index += 1;
-        
-        if self.history_index >= self.history_count {
-            // Clear to empty
-            self.pos = 0;
-            self.buffer = [0; MAX_CMD_LEN];
-            return;
-        }
-        
-        let entry = &self.history[self.history_index];
-        let len = core::cmp::min(entry.len, MAX_CMD_LEN - 1);
-        self.buffer[..len].copy_from_slice(&entry.cmd[..len]);
-        self.pos = len;
-    }
-    
-    /// Add to history
-    fn add_history(&mut self) {
-        if self.pos == 0 {
-            return;
-        }
-        
-        // Don't add duplicates
-        if self.history_count > 0 {
-            let last = &self.history[self.history_count - 1];
-            if last.len == self.pos && last.cmd[..self.pos] == self.buffer[..self.pos] {
-                return;
-            }
-        }
-        
-        if self.history_count < MAX_HISTORY {
-            let idx = self.history_count;
-            self.history[idx].cmd[..self.pos].copy_from_slice(&self.buffer[..self.pos]);
-            self.history[idx].len = self.pos;
-            self.history_count += 1;
-        } else {
-            // Shift history
-            for i in 0..MAX_HISTORY - 1 {
-                self.history[i] = self.history[i + 1];
-            }
-            self.history[MAX_HISTORY - 1].cmd[..self.pos].copy_from_slice(&self.buffer[..self.pos]);
-            self.history[MAX_HISTORY - 1].len = self.pos;
-        }
-        
-        self.history_index = self.history_count;
-    }
-    
-    /// Execute command
-    pub fn execute(&mut self) {
-        unsafe { cursor_putchar(b'\n'); }
-        
-        if self.pos == 0 {
-            return;
-        }
-        
-        self.add_history();
-        
-        let cmd_str = core::str::from_utf8(&self.buffer[..self.pos]).unwrap_or("").trim();
-        if cmd_str.is_empty() {
-            return;
-        }
-        
-        // Check for aliases first
-        let resolved = self.resolve_alias(cmd_str);
-        let final_cmd = if resolved.is_empty() { cmd_str } else { resolved.as_str() };
-        
-        // Parse command and arguments
-        let parts = self.parse_args(final_cmd);
-        if parts.is_empty() {
-            return;
-        }
-        
-        // Execute
-        match parts[0] {
-            // === ARCH LINUX ===
-            "pacman" => self.cmd_pacman(&parts),
-            "yay" => self.cmd_yay(&parts),
-            "makepkg" => self.cmd_makepkg(&parts),
-            "pkgbuild" => self.cmd_pkgbuild(&parts),
-            
-            // === UBUNTU/DEBIAN ===
-            "apt" => self.cmd_apt(&parts),
-            "apt-get" => self.cmd_apt_get(&parts),
-            "apt-cache" => self.cmd_apt_cache(&parts),
-            "apt-file" => self.cmd_apt_file(&parts),
-            "apt-mark" => self.cmd_apt_mark(&parts),
-            "dpkg" => self.cmd_dpkg(&parts),
-            "snap" => self.cmd_snap(&parts),
-            
-            // === GENTOO ===
-            "emerge" => self.cmd_emerge(&parts),
-            "equery" => self.cmd_equery(&parts),
-            "eselect" => self.cmd_eselect(&parts),
-            "portageq" => self.cmd_portageq(&parts),
-            "ebuild" => self.cmd_ebuild(&parts),
-            "quickpkg" => self.cmd_quickpkg(&parts),
-            "revdep-rebuild" => self.cmd_revdep_rebuild(&parts),
-            "eclean" => self.cmd_eclean(&parts),
-            
-            // === OTHER DISTROS ===
-            "dnf" => self.cmd_dnf(&parts),
-            "yum" => self.cmd_yum(&parts),
-            "rpm" => self.cmd_rpm(&parts),
-            "zypper" => self.cmd_zypper(&parts),
-            "apk" => self.cmd_apk(&parts),
-            
-            // === FILE OPERATIONS ===
-            "ls" => self.cmd_ls(&parts),
-            "ll" => self.cmd_ll(&parts),
-            "la" => self.cmd_la(&parts),
-            "cd" => self.cmd_cd(&parts),
-            "pwd" => self.cmd_pwd(),
-            "cat" => self.cmd_cat(&parts),
-            "touch" => self.cmd_touch(&parts),
-            "mkdir" => self.cmd_mkdir(&parts),
-            "rm" => self.cmd_rm(&parts),
-            "cp" => self.cmd_cp(&parts),
-            "mv" => self.cmd_mv(&parts),
-            "chmod" => self.cmd_chmod(&parts),
-            "chown" => self.cmd_chown(&parts),
-            "ln" => self.cmd_ln(&parts),
-            "find" => self.cmd_find(&parts),
-            "locate" => self.cmd_locate(&parts),
-            "which" => self.cmd_which(&parts),
-            "whereis" => self.cmd_whereis(&parts),
-            "whatis" => self.cmd_whatis(&parts),
-            "man" => self.cmd_man(&parts),
-            "info" => self.cmd_info(&parts),
-            "file" => self.cmd_file(&parts),
-            "stat" => self.cmd_stat(&parts),
-            "readlink" => self.cmd_readlink(&parts),
-            "realpath" => self.cmd_realpath(&parts),
-            "basename" => self.cmd_basename(&parts),
-            "dirname" => self.cmd_dirname(&parts),
-            "tree" => self.cmd_tree(&parts),
-            
-            // === TEXT PROCESSING ===
-            "grep" => self.cmd_grep(&parts),
-            "egrep" => self.cmd_grep(&parts),
-            "fgrep" => self.cmd_grep(&parts),
-            "awk" => self.cmd_awk(&parts),
-            "sed" => self.cmd_sed(&parts),
-            "cut" => self.cmd_cut(&parts),
-            "tr" => self.cmd_tr(&parts),
-            "sort" => self.cmd_sort(&parts),
-            "uniq" => self.cmd_uniq(&parts),
-            "wc" => self.cmd_wc(&parts),
-            "head" => self.cmd_head(&parts),
-            "tail" => self.cmd_tail(&parts),
-            "xargs" => self.cmd_xargs(&parts),
-            "tee" => self.cmd_tee(&parts),
-            "nl" => self.cmd_nl(&parts),
-            "fold" => self.cmd_fold(&parts),
-            "fmt" => self.cmd_fmt(&parts),
-            "pr" => self.cmd_pr(&parts),
-            "column" => self.cmd_column(&parts),
-            "paste" => self.cmd_paste(&parts),
-            "join" => self.cmd_join(&parts),
-            "split" => self.cmd_split(&parts),
-            "csplit" => self.cmd_csplit(&parts),
-            "expand" => self.cmd_expand(&parts),
-            "unexpand" => self.cmd_unexpand(&parts),
-            
-            // === SYSTEM INFO ===
-            "ps" => self.cmd_ps(&parts),
-            "top" => self.cmd_top(&parts),
-            "htop" => self.cmd_htop(&parts),
-            "btop" => self.cmd_btop(&parts),
-            "free" => self.cmd_free(&parts),
-            "uptime" => self.cmd_uptime(&parts),
-            "uname" => self.cmd_uname(&parts),
-            "whoami" => self.cmd_whoami(),
-            "who" => self.cmd_who(),
-            "w" => self.cmd_w(),
-            "id" => self.cmd_id(&parts),
-            "groups" => self.cmd_groups(),
-            "users" => self.cmd_users(),
-            "hostname" => self.cmd_hostname(&parts),
-            "hostnamectl" => self.cmd_hostnamectl(&parts),
-            "date" => self.cmd_date(&parts),
-            "cal" => self.cmd_cal(&parts),
-            "time" => self.cmd_time(&parts),
-            "timedatectl" => self.cmd_timedatectl(&parts),
-            "neofetch" => self.cmd_neofetch(),
-            "screenfetch" => self.cmd_screenfetch(),
-            "inxi" => self.cmd_inxi(&parts),
-            "lscpu" => self.cmd_lscpu(),
-            "lsmem" => self.cmd_lsmem(),
-            "lsusb" => self.cmd_lsusb(),
-            "lspci" => self.cmd_lspci(),
-            "lsblk" => self.cmd_lsblk(),
-            "df" => self.cmd_df(&parts),
-            "du" => self.cmd_du(&parts),
-            "fdisk" => self.cmd_fdisk(&parts),
-            "parted" => self.cmd_parted(&parts),
-            "mount" => self.cmd_mount(&parts),
-            "umount" => self.cmd_umount(&parts),
-            "findmnt" => self.cmd_findmnt(&parts),
-            "blkid" => self.cmd_blkid(&parts),
-            "dmesg" => self.cmd_dmesg(&parts),
-            "journalctl" => self.cmd_journalctl(&parts),
-            "sysctl" => self.cmd_sysctl(&parts),
-            "systemctl" => self.cmd_systemctl(&parts),
-            "service" => self.cmd_service(&parts),
-            "init" => self.cmd_init(&parts),
-            "runlevel" => self.cmd_runlevel(),
-            "chkconfig" => self.cmd_chkconfig(&parts),
-            "update-rc.d" => self.cmd_update_rc_d(&parts),
-            
-            // === NETWORK ===
-            "ping" => self.cmd_ping(&parts),
-            "ifconfig" => self.cmd_ifconfig(&parts),
-            "ip" => self.cmd_ip(&parts),
-            "netstat" => self.cmd_netstat(&parts),
-            "ss" => self.cmd_ss(&parts),
-            "route" => self.cmd_route(&parts),
-            "traceroute" => self.cmd_traceroute(&parts),
-            "tracepath" => self.cmd_tracepath(&parts),
-            "mtr" => self.cmd_mtr(&parts),
-            "nslookup" => self.cmd_nslookup(&parts),
-            "dig" => self.cmd_dig(&parts),
-            "host" => self.cmd_host(&parts),
-            "curl" => self.cmd_curl(&parts),
-            "wget" => self.cmd_wget(&parts),
-            "ssh" => self.cmd_ssh(&parts),
-            "scp" => self.cmd_scp(&parts),
-            "rsync" => self.cmd_rsync(&parts),
-            "sftp" => self.cmd_sftp(&parts),
-            "ftp" => self.cmd_ftp(&parts),
-            "telnet" => self.cmd_telnet(&parts),
-            "nc" => self.cmd_nc(&parts),
-            "nmap" => self.cmd_nmap(&parts),
-            "tcpdump" => self.cmd_tcpdump(&parts),
-            "tshark" => self.cmd_tshark(&parts),
-            "wireshark" => self.cmd_wireshark(&parts),
-            "iperf" => self.cmd_iperf(&parts),
-            "speedtest" => self.cmd_speedtest(&parts),
-            "ethtool" => self.cmd_ethtool(&parts),
-            "iw" => self.cmd_iw(&parts),
-            "iwconfig" => self.cmd_iwconfig(&parts),
-            "wpa_supplicant" => self.cmd_wpa_supplicant(&parts),
-            "nmcli" => self.cmd_nmcli(&parts),
-            "nmtui" => self.cmd_nmtui(),
-            
-            // === GIT ===
-            "git" => self.cmd_git(&parts),
-            "gh" => self.cmd_gh(&parts),
-            "glab" => self.cmd_glab(&parts),
-            
-            // === PROCESS MANAGEMENT ===
-            "kill" => self.cmd_kill(&parts),
-            "killall" => self.cmd_killall(&parts),
-            "pkill" => self.cmd_pkill(&parts),
-            "pgrep" => self.cmd_pgrep(&parts),
-            "pidof" => self.cmd_pidof(&parts),
-            "nice" => self.cmd_nice(&parts),
-            "renice" => self.cmd_renice(&parts),
-            "nohup" => self.cmd_nohup(&parts),
-            "disown" => self.cmd_disown(&parts),
-            "wait" => self.cmd_wait(&parts),
-            "jobs" => self.cmd_jobs(),
-            "fg" => self.cmd_fg(&parts),
-            "bg" => self.cmd_bg(&parts),
-            
-            // === EDITORS ===
-            "nano" => self.cmd_nano(&parts),
-            "vim" => self.cmd_vim(&parts),
-            "vi" => self.cmd_vi(&parts),
-            "emacs" => self.cmd_emacs(&parts),
-            "ed" => self.cmd_ed(&parts),
-            "ex" => self.cmd_ex(&parts),
-            "pico" => self.cmd_pico(&parts),
-            "micro" => self.cmd_micro(&parts),
-            "ne" => self.cmd_ne(&parts),
-            "jed" => self.cmd_jed(&parts),
-            
-            // === SHELL ===
-            "bash" => self.cmd_bash(&parts),
-            "sh" => self.cmd_sh(&parts),
-            "zsh" => self.cmd_zsh(&parts),
-            "fish" => self.cmd_fish(&parts),
-            "dash" => self.cmd_dash(&parts),
-            "csh" => self.cmd_csh(&parts),
-            "tcsh" => self.cmd_tcsh(&parts),
-            "ksh" => self.cmd_ksh(&parts),
-            "source" => self.cmd_source(&parts),
-            "export" => self.cmd_export(&parts),
-            "unset" => self.cmd_unset(&parts),
-            "alias" => self.cmd_alias(&parts),
-            "unalias" => self.cmd_unalias(&parts),
-            "history" => self.cmd_history_cmd(),
-            "eval" => self.cmd_eval(&parts),
-            "exec" => self.cmd_exec(&parts),
-            "trap" => self.cmd_trap(&parts),
-            "type" => self.cmd_type(&parts),
-            "hash" => self.cmd_hash(&parts),
-            "readonly" => self.cmd_readonly(&parts),
-            "local" => self.cmd_local(&parts),
-            "return" => self.cmd_return(&parts),
-            "shift" => self.cmd_shift(&parts),
-            "getopts" => self.cmd_getopts(&parts),
-            "set" => self.cmd_set(&parts),
-            "shopt" => self.cmd_shopt(&parts),
-            "enable" => self.cmd_enable(&parts),
-            "builtin" => self.cmd_builtin(&parts),
-            "command" => self.cmd_command(&parts),
-            "caller" => self.cmd_caller(&parts),
-            "logout" => self.cmd_logout(),
-            "suspend" => self.cmd_suspend(),
-            
-            // === COMPRESSION ===
-            "tar" => self.cmd_tar(&parts),
-            "gzip" => self.cmd_gzip(&parts),
-            "gunzip" => self.cmd_gunzip(&parts),
-            "zcat" => self.cmd_zcat(&parts),
-            "bzip2" => self.cmd_bzip2(&parts),
-            "bunzip2" => self.cmd_bunzip2(&parts),
-            "bzcat" => self.cmd_bzcat(&parts),
-            "xz" => self.cmd_xz(&parts),
-            "unxz" => self.cmd_unxz(&parts),
-            "lzma" => self.cmd_lzma(&parts),
-            "unlzma" => self.cmd_unlzma(&parts),
-            "zip" => self.cmd_zip(&parts),
-            "unzip" => self.cmd_unzip(&parts),
-            "zstd" => self.cmd_zstd(&parts),
-            "unzstd" => self.cmd_unzstd(&parts),
-            "7z" => self.cmd_7z(&parts),
-            "7za" => self.cmd_7za(&parts),
-            "rar" => self.cmd_rar(&parts),
-            "unrar" => self.cmd_unrar(&parts),
-            
-            // === CRYPTO ===
-            "md5sum" => self.cmd_md5sum(&parts),
-            "sha1sum" => self.cmd_sha1sum(&parts),
-            "sha256sum" => self.cmd_sha256sum(&parts),
-            "sha512sum" => self.cmd_sha512sum(&parts),
-            "base64" => self.cmd_base64(&parts),
-            "openssl" => self.cmd_openssl(&parts),
-            "gpg" => self.cmd_gpg(&parts),
-            "gpg2" => self.cmd_gpg2(&parts),
-            
-            // === HEX/BINARY ===
-            "xxd" => self.cmd_xxd(&parts),
-            "hexdump" => self.cmd_hexdump(&parts),
-            "od" => self.cmd_od(&parts),
-            "strings" => self.cmd_strings(&parts),
-            
-            // === FUN ===
-            "cowsay" => self.cmd_cowsay(&parts),
-            "cowthink" => self.cmd_cowthink(&parts),
-            "fortune" => self.cmd_fortune(&parts),
-            "sl" => self.cmd_sl(),
-            "cmatrix" => self.cmd_cmatrix(&parts),
-            
-            // === MISC ===
-            "clear" => self.cmd_clear(),
-            "echo" => self.cmd_echo(&parts),
-            "printf" => self.cmd_printf(&parts),
-            "yes" => self.cmd_yes(&parts),
-            "seq" => self.cmd_seq(&parts),
-            "rev" => self.cmd_rev(&parts),
-            "tac" => self.cmd_tac(&parts),
-            "shuf" => self.cmd_shuf(&parts),
-            "watch" => self.cmd_watch(&parts),
-            "timeout" => self.cmd_timeout(&parts),
-            "sleep" => self.cmd_sleep(&parts),
-            "true" => self.cmd_true(),
-            "false" => self.cmd_false(),
-            "test" => self.cmd_test(&parts),
-            "[" => self.cmd_test(&parts),
-            "expr" => self.cmd_expr(&parts),
-            "bc" => self.cmd_bc(&parts),
-            "factor" => self.cmd_factor(&parts),
-            "primes" => self.cmd_primes(&parts),
-            
-            // === HELP ===
-            "help" => self.cmd_help(),
-            "man" => self.cmd_man(&parts),
-            "info" => self.cmd_info(&parts),
-            "apropos" => self.cmd_apropos(&parts),
-            "whatis" => self.cmd_whatis(&parts),
-            "whereis" => self.cmd_whereis(&parts),
-            "which" => self.cmd_which(&parts),
-            
-            // === DESKTOP ===
-            "startx" => self.cmd_startx(&parts),
-            "xinit" => self.cmd_xinit(&parts),
-            "i3" => self.cmd_i3(&parts),
-            "sway" => self.cmd_sway(&parts),
-            "openbox" => self.cmd_openbox(&parts),
-            "xfce4-session" => self.cmd_xfce4_session(&parts),
-            "gnome-session" => self.cmd_gnome_session(&parts),
-            "startkde" => self.cmd_startkde(&parts),
-            "startlxqt" => self.cmd_startlxqt(&parts),
-            "startfluxbox" => self.cmd_startfluxbox(&parts),
-            
-            // === CONTAINERS ===
-            "docker" => self.cmd_docker(&parts),
-            "podman" => self.cmd_podman(&parts),
-            "kubectl" => self.cmd_kubectl(&parts),
-            "helm" => self.cmd_helm(&parts),
-            "docker-compose" => self.cmd_docker_compose(&parts),
-            
-            // === DEV TOOLS ===
-            "gcc" => self.cmd_gcc(&parts),
-            "g++" => self.cmd_gpp(&parts),
-            "make" => self.cmd_make(&parts),
-            "cmake" => self.cmd_cmake(&parts),
-            "ninja" => self.cmd_ninja(&parts),
-            "cargo" => self.cmd_cargo(&parts),
-            "rustc" => self.cmd_rustc(&parts),
-            "go" => self.cmd_go(&parts),
-            "python" => self.cmd_python(&parts),
-            "python3" => self.cmd_python3(&parts),
-            "node" => self.cmd_node(&parts),
-            "npm" => self.cmd_npm(&parts),
-            "ruby" => self.cmd_ruby(&parts),
-            "perl" => self.cmd_perl(&parts),
-            "php" => self.cmd_php(&parts),
-            
-            // === MULTIPLEXERS ===
-            "tmux" => self.cmd_tmux(&parts),
-            "screen" => self.cmd_screen(&parts),
-            "byobu" => self.cmd_byobu(&parts),
-            
-            // === FILE MANAGERS ===
-            "ranger" => self.cmd_ranger(&parts),
-            "nnn" => self.cmd_nnn(&parts),
-            "mc" => self.cmd_mc(&parts),
-            "vifm" => self.cmd_vifm(&parts),
-            
-            // === MODERN TOOLS ===
-            "fzf" => self.cmd_fzf(&parts),
-            "ripgrep" => self.cmd_ripgrep(&parts),
-            "fd" => self.cmd_fd(&parts),
-            "bat" => self.cmd_bat(&parts),
-            "exa" => self.cmd_exa(&parts),
-            "lsd" => self.cmd_lsd(&parts),
-            "zoxide" => self.cmd_zoxide(&parts),
-            "starship" => self.cmd_starship(&parts),
-            
-            _ => {
-                kprintln!("{}: command not found", parts[0]);
-                kprintln!("Type 'help' for available commands");
-                self.last_exit_code = 127;
-            }
-        }
-    }
-    
-    // ==================== ENVIRONMENT & ALIAS HELPERS ====================
-    
-    fn set_env(&mut self, name: &str, value: &str) {
-        // Check if exists
-        for i in 0..self.env_count {
-            let existing = core::str::from_utf8(&self.env[i].name).unwrap_or("");
-            if existing.trim_matches('\0') == name {
-                // Update
-                let vbytes = value.as_bytes();
-                let vlen = core::cmp::min(vbytes.len(), 255);
-                self.env[i].value = [0; 256];
-                self.env[i].value[..vlen].copy_from_slice(&vbytes[..vlen]);
-                return;
-            }
-        }
-        
-        // Add new
-        if self.env_count < 64 {
-            let idx = self.env_count;
-            let nbytes = name.as_bytes();
-            let nlen = core::cmp::min(nbytes.len(), 63);
-            self.env[idx].name = [0; 64];
-            self.env[idx].name[..nlen].copy_from_slice(&nbytes[..nlen]);
-            
-            let vbytes = value.as_bytes();
-            let vlen = core::cmp::min(vbytes.len(), 255);
-            self.env[idx].value = [0; 256];
-            self.env[idx].value[..vlen].copy_from_slice(&vbytes[..vlen]);
-            
-            self.env_count += 1;
-        }
-    }
-    
-    fn get_env(&self, name: &str) -> &str {
-        for i in 0..self.env_count {
-            let existing = core::str::from_utf8(&self.env[i].name).unwrap_or("");
-            if existing.trim_matches('\0') == name {
-                let value = core::str::from_utf8(&self.env[i].value).unwrap_or("");
-                return value.trim_matches('\0');
-            }
-        }
-        ""
-    }
-    
-    fn set_alias(&mut self, name: &str, cmd: &str) {
-        for i in 0..self.alias_count {
-            let existing = core::str::from_utf8(&self.aliases[i].name).unwrap_or("");
-            if existing.trim_matches('\0') == name {
-                let cbytes = cmd.as_bytes();
-                let clen = core::cmp::min(cbytes.len(), MAX_CMD_LEN - 1);
-                self.aliases[i].cmd = [0; MAX_CMD_LEN];
-                self.aliases[i].cmd[..clen].copy_from_slice(&cbytes[..clen]);
-                return;
-            }
-        }
-        
-        if self.alias_count < 32 {
-            let idx = self.alias_count;
-            let nbytes = name.as_bytes();
-            let nlen = core::cmp::min(nbytes.len(), 63);
-            self.aliases[idx].name = [0; 64];
-            self.aliases[idx].name[..nlen].copy_from_slice(&nbytes[..nlen]);
-            
-            let cbytes = cmd.as_bytes();
-            let clen = core::cmp::min(cbytes.len(), MAX_CMD_LEN - 1);
-            self.aliases[idx].cmd = [0; MAX_CMD_LEN];
-            self.aliases[idx].cmd[..clen].copy_from_slice(&cbytes[..clen]);
-            
-            self.alias_count += 1;
-        }
-    }
-    
-    fn resolve_alias(&self, cmd: &str) -> String {
-        let first_word = cmd.split_whitespace().next().unwrap_or("");
-        for i in 0..self.alias_count {
-            let name = core::str::from_utf8(&self.aliases[i].name).unwrap_or("");
-            if name.trim_matches('\0') == first_word {
-                let aliased = core::str::from_utf8(&self.aliases[i].cmd).unwrap_or("");
-                return aliased.trim_matches('\0').to_string();
-            }
-        }
-        String::new()
-    }
-    
-    fn parse_args<'a>(&self, cmd: &'a str) -> Vec<&'a str> {
-        let mut args = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut quote_char = '\0';
-        
-        for c in cmd.chars() {
-            if c == ' ' && !in_quotes {
-                if !current.is_empty() {
-                    args.push(current.clone());
-                    current.clear();
-                }
-            } else if (c == '"' || c == '\'') && !in_quotes {
-                in_quotes = true;
-                quote_char = c;
-            } else if c == quote_char && in_quotes {
-                in_quotes = false;
-                quote_char = '\0';
-            } else {
-                current.push(c);
-            }
-        }
-        
-        if !current.is_empty() {
-            args.push(current);
-        }
-        
-        args
-    }
-    
-    // ==================== COMMAND IMPLEMENTATIONS ====================
-    
-    // --- ARCH LINUX ---
-    fn cmd_pacman(&self, args: &[&str]) {
-        if args.len() > 1 {
-            match args[1] {
-                "-S" | "--sync" => {
-                    if args.len() > 2 && args[2] == "-y" {
-                        kprintln!(":: Synchronizing package databases...");
-                        kprintln!(" myos-core is up to date");
-                        kprintln!(" myos-extra is up to date");
-                        kprintln!(" myos-community is up to date");
-                    } else if args.len() > 2 && args[2] == "-u" {
-                        kprintln!(":: Starting full system upgrade...");
-                        kprintln!(" there is nothing to do");
-                    } else if args.len() > 2 {
-                        kprintln!("resolving dependencies...");
-                        kprintln!("looking for conflicting packages...");
-                        kprintln!("");
-                        kprintln!("Packages ({}) {}", args.len() - 2, args[2..].join(" "));
-                        kprintln!("");
-                        kprintln!("Total Installed Size:   45.67 MiB");
-                        kprintln!("Net Upgrade Size:       12.34 MiB");
-                        kprintln!("");
-                        kprintln!(":: Proceed with installation? [Y/n] ");
-                        // Auto-confirm for demo
-                        kprintln!("(Y) -> installing {}...", args[2]);
-                        kprintln!(":: Running post-transaction hooks...");
-                        kprintln!("(1/3) Arming ConditionNeedsUpdate...");
-                        kprintln!("(2/3) Updating icon theme caches...");
-                        kprintln!("(3/3) Updating the desktop file MIME type cache...");
+                0x20..=0x7E => {
+                    if POS < MAX_CMD_LEN - 1 {
+                        BUF[POS] = c;
+                        POS += 1;
+                        pb(c);
                     }
                 }
-                "-R" | "--remove" => {
-                    kprintln!("checking dependencies...");
-                    kprintln!("");
-                    kprintln!("Packages ({}) {}", args.len() - 2, args[2..].join(" "));
-                    kprintln!("");
-                    kprintln!("Total Removed Size:  23.45 MiB");
-                    kprintln!("");
-                    kprintln!(":: Do you want to remove these packages? [Y/n] ");
-                    kprintln!("(Y) -> removing {}...", args[2]);
-                }
-                "-Q" | "--query" => {
-                    if args.len() > 2 && args[2] == "-i" {
-                        kprintln!("Name            : {}", args[3]);
-                        kprintln!("Version         : 1.0.0-1");
-                        kprintln!("Description     : MyOS package");
-                        kprintln!("Architecture    : x86_64");
-                        kprintln!("URL             : https://myos.org/packages/{}", args[3]);
-                        kprintln!("Licenses        : GPL");
-                        kprintln!("Groups          : None");
-                        kprintln!("Provides        : None");
-                        kprintln!("Depends On      : glibc");
-                        kprintln!("Optional Deps   : None");
-                        kprintln!("Required By     : None");
-                        kprintln!("Conflicts With  : None");
-                        kprintln!("Replaces        : None");
-                        kprintln!("Installed Size  : 1024.00 KiB");
-                        kprintln!("Packager        : MyOS Build System <build@myos.org>");
-                        kprintln!("Build Date      : Mon 01 Jan 2026 00:00:00 UTC");
-                        kprintln!("Install Date    : Mon 01 Jan 2026 00:00:00 UTC");
-                        kprintln!("Install Reason  : Explicitly installed");
-                        kprintln!("Install Script  : No");
-                        kprintln!("Validated By    : Signature");
-                    } else {
-                        kprintln!("myos-core 1.0.0-1");
-                        kprintln!("myos-kernel 6.1.0-1");
-                        kprintln!("bash 5.2.0-1");
-                        kprintln!("vim 9.0.0-1");
-                        kprintln!("gcc 12.2.0-1");
-                        kprintln!("glibc 2.36-1");
-                        kprintln!("systemd 252-1");
-                        kprintln!("linux-firmware 20230101-1");
-                    }
-                }
-                "-Syu" => {
-                    kprintln!(":: Synchronizing package databases...");
-                    kprintln!(" myos-core                               15.3 KiB   153 KiB/s 00:00 [########################################] 100%");
-                    kprintln!(" myos-extra                              23.7 KiB   237 KiB/s 00:00 [########################################] 100%");
-                    kprintln!(" myos-community                          45.2 KiB   452 KiB/s 00:00 [########################################] 100%");
-                    kprintln!(":: Starting full system upgrade...");
-                    kprintln!(" there is nothing to do");
-                }
-                _ => kprintln!("usage: pacman <operation> [...]"),
+                _ => {}
             }
-        } else {
-            kprintln!("usage: pacman <operation> [...]");
-            kprintln!("operations:");
-            kprintln!("    pacman {-h --help}");
-            kprintln!("    pacman {-V --version}");
-            kprintln!("    pacman {-D --database} <options> <package(s)>");
-            kprintln!("    pacman {-Q --query}    [options] [package(s)]");
-            kprintln!("    pacman {-R --remove}   [options] <package(s)>");
-            kprintln!("    pacman {-S --sync}     [options] [package(s)]");
-            kprintln!("    pacman {-T --deptest}  [options] [package(s)]");
-            kprintln!("    pacman {-U --upgrade}  [options] <file(s)>");
-            kprintln!("");
-            kprintln!("use 'pacman {-h --help}' with an operation for available options");
         }
     }
-    
-    fn cmd_yay(&self, args: &[&str]) {
-        kprintln!(":: Checking for AUR updates...");
-        kprintln!(":: PKGBUILDs are up to date");
-        kprintln!(":: 0 Packages to upgrade.");
-    }
-    
-    fn cmd_makepkg(&self, _args: &[&str]) {
-        kprintln!("==> Making package: mypkg 1.0.0-1 (Mon 01 Jan 2026 00:00:00 UTC)");
-        kprintln!("==> Checking runtime dependencies...");
-        kprintln!("==> Checking buildtime dependencies...");
-        kprintln!("==> Retrieving sources...");
-        kprintln!("  -> Found mypkg-1.0.0.tar.gz");
-        kprintln!("==> Validating source files with sha256sums...");
-        kprintln!("    mypkg-1.0.0.tar.gz ... Passed");
-        kprintln!("==> Extracting sources...");
-        kprintln!("  -> Extracting mypkg-1.0.0.tar.gz with bsdtar");
-        kprintln!("==> Starting build()...");
-        kprintln!("==> Entering fakeroot environment...");
-        kprintln!("==> Starting package()...");
-        kprintln!("==> Tidying install...");
-    }
+}
+
+
+#[no_mangle]
+pub extern "C" fn shell_init() {
+    let t = Terminal::new();
+    t.init();
+}
+
+
+#[no_mangle]
+pub extern "C" fn shell_input_char(c: u8) {
+    let t = Terminal::new();
+    t.input(c);
 }
