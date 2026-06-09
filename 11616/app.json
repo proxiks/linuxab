@@ -1,0 +1,11 @@
+{
+  "apps": [
+    {
+      "name": "terminal",
+      "description": "Bash-like terminal",
+      "version": "1.0.0",
+      "url": "http://repo.linuxab.local/apps/terminal.bin",
+      "size_kb": 45
+    }
+  ]
+}
