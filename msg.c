@@ -23,23 +23,23 @@
  * Pavel Emelianov <xemul@openvz.org>
  */
 
-#include <linux/capability.h>
-#include <linux/msg.h>
-#include <linux/spinlock.h>
-#include <linux/init.h>
-#include <linux/mm.h>
-#include <linux/proc_fs.h>
-#include <linux/list.h>
-#include <linux/security.h>
-#include <linux/sched/wake_q.h>
-#include <linux/syscalls.h>
-#include <linux/audit.h>
-#include <linux/seq_file.h>
-#include <linux/rwsem.h>
-#include <linux/nsproxy.h>
-#include <linux/ipc_namespace.h>
-#include <linux/rhashtable.h>
-#include <linux/percpu_counter.h>
+#include <linuxab/capability.h>
+#include <linuxab/msg.h>
+#include <linuxab/spinlock.h>
+#include <linuxab/init.h>
+#include <linuxab/mm.h>
+#include <linuxab/proc_fs.h>
+#include <linuxab/list.h>
+#include <linuxab/security.h>
+#include <linuxab/sched/wake_q.h>
+#include <linuxab/syscalls.h>
+#include <linuxab/audit.h>
+#include <linuxab/seq_file.h>
+#include <linuxab/rwsem.h>
+#include <linuxab/nsproxy.h>
+#include <linuxab/ipc_namespace.h>
+#include <linuxab/rhashtable.h>
+#include <linuxab/percpu_counter.h>
 
 #include <asm/current.h>
 #include <linux/uaccess.h>
